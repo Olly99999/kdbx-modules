@@ -62,11 +62,16 @@ normlog:{[logdict]
     logdict]
   };
 
-/ extract a required dependency dictionary, erroring immediately if absent or null
-requiredep:{[deps;name]
+/ extract a required dependency dict, erroring if absent, null, not a dict, or missing a required key
+/ nested if guards (not and) - key would throw on a non-dict if evaluated eagerly
+requiredep:{[deps;name;reqkeys]
   d:$[99h=type deps;$[(name in key deps) and not (::)~deps name;deps name;()!()];()!()];
   if[not count d;
-    '"di.heartbeat: ",(string name)," dependency is required; pass it via init deps - see di.",string name];
+    '"di.heartbeat: ",(string name)," dependency is required and must be a non-empty function dict; pass it via init deps - see heartbeat.md"];
+  if[99h<>type d;
+    '"di.heartbeat: ",(string name)," dependency must be a dict of functions"];
+  if[not all reqkeys in key d;
+    '"di.heartbeat: ",(string name)," dependency must provide ",(", " sv string reqkeys),"; got: ",", " sv string key d];
   d
   };
 
@@ -79,8 +84,8 @@ tosecs:{[span] `int$span%0D00:00:01};
 
 / wire the injected dependencies from the single deps dict (which also carries config keys)
 setdeps:{[deps]
+  / validate every dependency before writing any module state so a failed init leaves state untouched
   / log, timer and pubsub are required; servers and handlers only when monitoring
-  / init errors immediately if deps is not a dictionary or a required dependency is missing/malformed
   / nested if guards (not and) - and evaluates both sides eagerly and key would throw on a non-dict
   if[99h<>type deps;
     '"di.heartbeat: deps must be a dictionary of config and injected dependencies - see heartbeat.md"];
@@ -93,24 +98,26 @@ setdeps:{[deps]
   lg:normlog deps`log;
   if[not all `info`warn`error in key lg;
     '"di.heartbeat: log must provide info/warn/error; got: ",", " sv string key lg];
+  timerdict:requiredep[deps;`timer;`addjob`deletejobs];
+  pubsubdict:requiredep[deps;`pubsub;`publish`subscribe];
+  / servers/handlers required only when monitoring; take subenabled from deps as setconfig runs after
+  sub:$[`subenabled in key deps;deps`subenabled;0b];
+  serversdict:$[sub;requiredep[deps;`servers;enlist`getservers];()!()];
+  handlersdict:$[sub;requiredep[deps;`handlers;enlist`register];()!()];
+  / all validated - wire module state (no further throws)
   .z.m.log:lg;
-  timerdict:requiredep[deps;`timer];
   .z.m.timeraddjob:timerdict`addjob;
   .z.m.timerdeletejobs:timerdict`deletejobs;
-  pubsubdict:requiredep[deps;`pubsub];
   .z.m.pubsubpublish:pubsubdict`publish;
   .z.m.pubsubsubscribe:pubsubdict`subscribe;
-  / monitor-only deps are wired via a separate function so the conditional stays a
-  / single statement - the style guide says avoid block statements within conditionals
-  if[subenabled;setmonitordeps deps];
+  if[sub;setmonitordeps[serversdict;handlersdict]];
   };
 
 / wire the monitor-only dependencies, required only when subenabled (this process monitors others)
-setmonitordeps:{[deps]
-  / split out of setdeps to keep that conditional a single statement per the coding standards
-  serversdict:requiredep[deps;`servers];
+setmonitordeps:{[serversdict;handlersdict]
+  / wire the monitor-only dependencies (already validated by setdeps) - split out so the
+  / subenabled conditional in setdeps stays a single statement per the coding standards
   .z.m.serversgetservers:serversdict`getservers;
-  handlersdict:requiredep[deps;`handlers];
   .z.m.handlersregister:handlersdict`register;
   };
 
@@ -165,22 +172,24 @@ logerrproc:{[r]
   };
 
 / move processes into warning state, log and fire the warning callback
+/ project error:0b too so a warning transition fully defines the flags (a status=1 row is below the error threshold)
 warn:{[procs]
   if[debug;logwarnproc each 0!procs];
-  .z.m.hb:hb upsert select sym,procname,warning:1b from procs;
+  .z.m.hb:hb upsert select sym,procname,warning:1b,error:0b from procs;
   onwarning procs;
   };
 
 / move processes into error state, log and fire the error callback
+/ project warning:0b too so an error transition fully defines the flags (mutually exclusive with warning)
 err:{[procs]
   if[debug;logerrproc each 0!procs];
-  .z.m.hb:hb upsert select sym,procname,error:1b from procs;
+  .z.m.hb:hb upsert select sym,procname,warning:0b,error:1b from procs;
   onerror procs;
   };
 
 / subscribe to a single remote heartbeat publisher, logging and skipping on failure
 subscribeone:{[h]
-  ok:@[{.z.m.pubsubsubscribe x;1b};h;{[h;e] .z.m.log[`error][`heartbeat;"failed to subscribe to heartbeats on handle ",(string h),": ",e];0b}[h]];
+  ok:@[{.z.m.pubsubsubscribe x;1b};h;{[hdl;e] .z.m.log[`error][`heartbeat;"failed to subscribe to heartbeats on handle ",(string hdl),": ",e];0b}[h]];
   if[ok;.z.m.subscribedhandles:distinct subscribedhandles,h];
   };
 
@@ -222,6 +231,8 @@ checkheartbeat:{
   wp:warningperiod each t`sym;
   ep:errorperiod each t`sym;
   stats:update status:(`short$now>time+wp)+`short$2*now>time+ep from t;
+  / newwarn/newerr are rows of the store (built from 0!hb), so warn/err only update flags on
+  / existing rows and never insert - avoids seeding a null-time row that would look instantly stale
   newwarn:select sym,procname,time from stats where status=1,not warning;
   newerr:select sym,procname,time from stats where status>1,not error;
   if[count newwarn;warn newwarn];
@@ -263,8 +274,8 @@ init:{[deps]
   / note: the module keeps its own clock (cp, default .z.p) - override via setcp
   / example:
   /   heartbeat.init[`proctype`procname`log`timer`pubsub!(`rdb;`rdb1;kxlog;timerdep;psdep)]
-  setconfig deps;
   setdeps deps;
+  setconfig deps;
   registertimers[];
   registerhandlers[];
   .z.m.log[`info][`heartbeat;"di.heartbeat initialised"];
